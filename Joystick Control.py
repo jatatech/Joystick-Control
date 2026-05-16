@@ -1,90 +1,17 @@
 import os
 import sys
-import platform
-import subprocess
 
 from . import config
 from .lib import fusionAddInUtils as futil
 from adsk.core import LogLevels
 
-def getPythonExecutable():
-    addInDir = sys.path[0]
-    candidates = (
-        os.path.join(addInDir, "Python", "python.exe"),
-        os.path.join(addInDir, "Python", "python"),
-        sys.executable,
-    )
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return sys.executable
-
-
-def getVirtualenvPython(virtualenv):
-    if platform.system() == "Windows":
-        return os.path.join(virtualenv, "Scripts", "python.exe")
-    return os.path.join(virtualenv, "bin", "python")
-
-
-def getVirtualenvSitePackages(virtualenv):
-    if platform.system() == "Windows":
-        return os.path.join(virtualenv, "Lib", "site-packages")
-    pythonVersion = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    return os.path.join(virtualenv, "lib", pythonVersion, "site-packages")
-
-
-def installPygame():
-    virtualenvDirName = f"{config.ADDIN_NAME}Venv"
-    # Clean up path in case we crashed somewhere, sys should not contain our virtualenv yet
-    sys.path = [dir for dir in sys.path if dir.find(virtualenvDirName) == -1]
-
-    original_sys_path = sys.path.copy()
-
-    virtualenv = os.path.join(sys.path[0], virtualenvDirName)
-    python = getPythonExecutable()
-    virtualenvPython = getVirtualenvPython(virtualenv)
-    virtualenvSitePackages = getVirtualenvSitePackages(virtualenv)
-
-    if not os.path.isdir(virtualenv):
-        futil.log(f"{config.ADDIN_NAME}: missing virtualenv, creating...", LogLevels.WarningLogLevel)
-        subprocess.check_call([python, '-m', 'venv', virtualenv]) 
-
-    futil.log(f"{config.ADDIN_NAME}: virtualenv exists, attempting to import from virtualenv", LogLevels.InfoLogLevel)
-    # in case of script failure, the virtualenv might already be in the path from a previous run
-    if virtualenvSitePackages not in sys.path:
-        sys.path.insert(0, virtualenvSitePackages)
-    try:
-        import pygame
-        return(True, original_sys_path.copy())
-    except:
-        try:
-            futil.log(f"{config.ADDIN_NAME}: missing pygame, installing...", LogLevels.WarningLogLevel)
-            subprocess.check_call([virtualenvPython, "-m", "pip", "install", "--upgrade", "pygame"])
-            futil.log(f"{config.ADDIN_NAME}: pygame installed", LogLevels.InfoLogLevel)
-            return (True, original_sys_path.copy())
-        except:
-            futil.handle_error("Failed to install and import pygame. Falling back to pyjoystick if available. See text console for more details", True)
-            return (False, original_sys_path.copy())
+ADDIN_DIR = os.path.dirname(os.path.realpath(__file__))
+BACKEND_PYGAME = "pygame"
+BACKEND_PYJOYSTICK = "pyjoystick"
 
 installedPygame = False
-original_sys_path = sys.path.copy()
-
-try:
-    import pygame
-    installedPygame = True
-    futil.log(f"{config.ADDIN_NAME}: using existing pygame install", LogLevels.InfoLogLevel)
-except:
-    (installedPygame, original_sys_path) = installPygame()
-    if installedPygame:
-        try:
-            import pygame
-            futil.log(f"{config.ADDIN_NAME}: pygame installed", LogLevels.InfoLogLevel)
-        except:
-            futil.handle_error(f"{config.ADDIN_NAME}: Failed to import pygame, falling back to use pyjoystick (less gamepad support). See text console for more details", True)
-            installedPygame = False
-    else:
-        futil.log(f"{config.ADDIN_NAME}: pygame unavailable, falling back to pyjoystick", LogLevels.WarningLogLevel)
-    sys.path = original_sys_path
+selectedJoystickBackend = None
+backendBootstrapError = None
 
 
 pyjoystickRunEventLoop = None
@@ -98,13 +25,55 @@ def loadPyJoystickEventLoop():
     return pyjoystickRunEventLoop
 
 
+def selectJoystickBackend():
+    global installedPygame
+    global selectedJoystickBackend
+    global backendBootstrapError
+    global pygame
+
+    try:
+        import pygame as importedPygame
+
+        pygame = importedPygame
+        installedPygame = True
+        selectedJoystickBackend = BACKEND_PYGAME
+        backendBootstrapError = None
+        futil.log(f"{config.ADDIN_NAME}: using existing pygame install", LogLevels.InfoLogLevel)
+        return
+    except Exception as pygameError:
+        installedPygame = False
+        futil.log(
+            f"{config.ADDIN_NAME}: pygame is unavailable ({pygameError}); trying vendored pyjoystick/SDL2 backend",
+            LogLevels.WarningLogLevel,
+        )
+
+    try:
+        loadPyJoystickEventLoop()
+        selectedJoystickBackend = BACKEND_PYJOYSTICK
+        backendBootstrapError = None
+        futil.log(
+            f"{config.ADDIN_NAME}: using vendored pyjoystick/SDL2 backend from {ADDIN_DIR!r}",
+            LogLevels.InfoLogLevel,
+        )
+    except Exception as backendError:
+        selectedJoystickBackend = None
+        backendBootstrapError = backendError
+        futil.log(
+            f"{config.ADDIN_NAME}: failed to initialize any joystick backend ({backendError})",
+            LogLevels.ErrorLogLevel,
+        )
+
+
+selectJoystickBackend()
+
+
 from .Modules.pyjoystick.interface import KeyTypes, Key, Joystick
 
 from adsk.core import Vector3D, Matrix3D, Application, Point3D, Camera, ViewOrientations
 from time import sleep
 from math import pow, pi, radians
 from adsk import doEvents
-from threading import Event, Thread
+from threading import Event, Thread, Lock
 from typing import Literal
 
 # Special number to tell camera to go orientation home
@@ -119,21 +88,30 @@ ZOOM_SCALE = 0.1
 PAN_AXIS_SCALE = 0.1
 ROTATION_AXIS_SCALE = 0.01
 PAN_ZOOM_COMPENSATION = 0.0005
-ZOOM_EXTENT_MULTIPLIER = 0.1
 AXIS_DEADZONE = 0.15
-JOYCON_STICK_X_AXIS = 0
-JOYCON_STICK_Y_AXIS = 1
-JOYCON_BUTTON_B = 0
+CAMERA_VECTOR_EPSILON = 1e-6
+JOYCON_PAN_SENSITIVITY = 0.75
+JOYCON_ROTATION_HORIZONTAL_SENSITIVITY = 0.34
+JOYCON_ROTATION_VERTICAL_SENSITIVITY = 0.3
+JOYCON_ZOOM_SENSITIVITY = 0.3
+JOYCON_PAN_RESPONSE_EXPONENT = 1.8
+JOYCON_ROTATION_HORIZONTAL_RESPONSE_EXPONENT = 1.65
+JOYCON_ROTATION_VERTICAL_RESPONSE_EXPONENT = 1.8
+JOYCON_ZOOM_RESPONSE_EXPONENT = 1.8
+JOYCON_STICK_X_AXIS = 1
+JOYCON_STICK_Y_AXIS = 0
+JOYCON_BUTTON_X = 0
 JOYCON_BUTTON_A = 1
 JOYCON_BUTTON_Y = 2
-JOYCON_BUTTON_X = 3
-JOYCON_BUTTON_R = 5
-JOYCON_BUTTON_ZR = 7
-JOYCON_BUTTON_PLUS = 9
-JOYCON_BUTTON_STICK = 11
-JOYCON_BUTTON_HOME = 12
+JOYCON_BUTTON_B = 3
+JOYCON_BUTTON_HOME = 5
+JOYCON_BUTTON_PLUS = 6
+JOYCON_BUTTON_R = 16
+JOYCON_BUTTON_ZR = 18
+JOYCON_BUTTON_STICK = 17
 JOYCON_BUTTON_SR = 13
 JOYCON_BUTTON_SL = 14
+
 if not installedPygame:
     PAN_X_AXIS = 0
     PAN_Y_AXIS = 1
@@ -162,15 +140,38 @@ BUTTON_TO_VIEW = {
     9: CONSTRAIN_ORIENTATION,
 }
 JOYCON_BUTTON_TO_VIEW = {
-    JOYCON_BUTTON_A: ViewOrientations.FrontViewOrientation,
-    JOYCON_BUTTON_B: ViewOrientations.BackViewOrientation,
+    JOYCON_BUTTON_A: ViewOrientations.RightViewOrientation,
+    JOYCON_BUTTON_B: ViewOrientations.BottomViewOrientation,
     JOYCON_BUTTON_X: ViewOrientations.TopViewOrientation,
-    JOYCON_BUTTON_Y: ViewOrientations.BottomViewOrientation,
+    JOYCON_BUTTON_Y: ViewOrientations.LeftViewOrientation,
     JOYCON_BUTTON_HOME: HOME_ORIENTATION,
     JOYCON_BUTTON_STICK: CONSTRAIN_ORIENTATION,
-    JOYCON_BUTTON_PLUS: ViewOrientations.RightViewOrientation,
+    JOYCON_BUTTON_PLUS: ViewOrientations.FrontViewOrientation,
     JOYCON_BUTTON_SR: ViewOrientations.LeftViewOrientation,
 }
+
+JOYCON_BUTTON_NAME_TO_VIEW = {
+    "a": ViewOrientations.TopViewOrientation,
+    "b": ViewOrientations.RightViewOrientation,
+    "x": ViewOrientations.LeftViewOrientation,
+    "y": ViewOrientations.BottomViewOrientation,
+    "back": HOME_ORIENTATION,
+    "guide": HOME_ORIENTATION,
+    "leftstick": CONSTRAIN_ORIENTATION,
+    "start": ViewOrientations.FrontViewOrientation,
+}
+
+JOYCON_GUID_KEYWORDS = (
+    "7e05000007200000",
+    "joy-con (r)",
+    "nintendo switch right joy-con",
+)
+
+JOYCON_AXIS_NAME_X = ("leftx", "rightx")
+JOYCON_AXIS_NAME_Y = ("lefty", "righty")
+JOYCON_BUTTON_NAME_R = ("rightshoulder",)
+JOYCON_BUTTON_NAME_ZR = ("leftshoulder", "righttrigger")
+JOYCON_RAW_SIGNATURE_BUTTONS = frozenset((JOYCON_BUTTON_R, JOYCON_BUTTON_ZR, JOYCON_BUTTON_HOME, JOYCON_BUTTON_PLUS))
 
 JOYCON_NAME_KEYWORDS = (
     "joy-con (r)",
@@ -178,6 +179,68 @@ JOYCON_NAME_KEYWORDS = (
     "joy-con right",
     "joycon right",
 )
+
+CAMERA_UPDATE_EVENT_ID = f"{config.COMPANY_NAME}_{config.ADDIN_NAME}_camera_update".replace(" ", "_")
+
+cameraUpdateEvent = None
+cameraStateLock = Lock()
+cameraUpdateQueued = False
+pendingOrientation = None
+
+
+def requestCameraUpdate() -> None:
+    global cameraUpdateQueued
+
+    with cameraStateLock:
+        if cameraUpdateEvent is None or cameraUpdateQueued:
+            return
+        cameraUpdateQueued = True
+
+    try:
+        app.fireCustomEvent(CAMERA_UPDATE_EVENT_ID)
+    except:
+        with cameraStateLock:
+            cameraUpdateQueued = False
+        futil.handle_error(f"{config.ADDIN_NAME}: failed to fire camera update event")
+
+
+def queueOrientation(nextOrientation: ViewOrientations | Literal[-1, -2]) -> None:
+    global pendingOrientation
+
+    if nextOrientation is None:
+        return
+
+    with cameraStateLock:
+        pendingOrientation = nextOrientation
+
+    requestCameraUpdate()
+
+
+def processPendingCameraUpdate() -> None:
+    global cameraUpdateQueued
+    global pendingOrientation
+
+    with cameraStateLock:
+        cameraUpdateQueued = False
+        nextOrientation = pendingOrientation
+        pendingOrientation = None
+
+    if nextOrientation is not None:
+        orientCam(nextOrientation)
+
+    moveCamForCurrentInput()
+
+
+def hasActiveCameraInput() -> bool:
+    with cameraStateLock:
+        if pendingOrientation is not None:
+            return True
+
+    return any(axis != 0 for axis in getCurrentInputAxes())
+
+
+def onCameraUpdate(args) -> None:
+    processPendingCameraUpdate()
 
 
 class PyJoystickThread(Thread):
@@ -199,21 +262,33 @@ class PyJoystickThread(Thread):
             key (Key): joystick keys
         """
         if key.keytype is KeyTypes.AXIS:
+            maybeSetJoyconProfileFromRawEvent(axis=key.number, joystick=getattr(key, "joystick", None))
             axisValues[key.number] = key.get_proper_value()
+            controlName = getKeyControlName(key)
+            if controlName:
+                axisValuesByControlName[controlName] = key.get_proper_value()
+            requestCameraUpdate()
         elif key.keytype is KeyTypes.HAT:
             hatCam(key.get_hat_name())
         elif key.keytype is KeyTypes.BUTTON:
+            maybeSetJoyconProfileFromRawEvent(button=key.number, joystick=getattr(key, "joystick", None))
+            controlName = getKeyControlName(key)
             if key.value:
                 pressedButtons.add(key.number)
-                buttonCam(key.number)
+                if controlName:
+                    pressedControlNames.add(controlName)
+                buttonCam(key.number, controlName)
             else:
                 pressedButtons.discard(key.number)
+                if controlName:
+                    pressedControlNames.discard(controlName)
+                requestCameraUpdate()
 
     def add(self, joy: Joystick):
         """
         pyjoystick doesn't work without this callback, so use it to detect profile.
         """
-        setControllerProfileFromName(joy.get_name())
+        setControllerProfileFromJoystick(joy)
         return
 
     def remove(self, joy: Joystick):
@@ -264,17 +339,21 @@ class PyGameThread(Thread):
                             del self.pygameJoysticks[event.instance_id]
 
                     if event.type == pygame.JOYBUTTONDOWN:
+                        maybeSetJoyconProfileFromRawEvent(button=event.button, joystick=self.pygameJoysticks.get(event.instance_id))
                         pressedButtons.add(event.button)
                         buttonCam(event.button)
 
                     if event.type == pygame.JOYBUTTONUP:
                         pressedButtons.discard(event.button)
+                        requestCameraUpdate()
 
                     if event.type == pygame.JOYHATMOTION:
                         hatCam(pygameToHatName(event.value))
 
                     if event.type == pygame.JOYAXISMOTION:
+                        maybeSetJoyconProfileFromRawEvent(axis=event.axis, joystick=self.pygameJoysticks.get(event.instance_id))
                         axisValues[event.axis] = event.value
+                        requestCameraUpdate()
         except:
             pass
 
@@ -290,7 +369,8 @@ class RenderThread(Thread):
     def run(self):
         while alive():
             try:
-                moveCamForCurrentInput()
+                if hasActiveCameraInput():
+                    requestCameraUpdate()
                 sleep(0.01)
             except:
                 pass
@@ -300,27 +380,39 @@ def run(context):
     try:
         global stopFlag
         global axisValues
+        global axisValuesByControlName
         global pressedButtons
+        global pressedControlNames
         global controllerProfile
         global app
+        global cameraUpdateEvent
+        global cameraUpdateQueued
+        global pendingOrientation
         app = Application.get()
         axisValues = {}
+        axisValuesByControlName = {}
         pressedButtons = set()
+        pressedControlNames = set()
         controllerProfile = CONTROLLER_PROFILE_DEFAULT
         stopFlag = Event()
+        cameraUpdateQueued = False
+        pendingOrientation = None
+        cameraUpdateEvent = app.registerCustomEvent(CAMERA_UPDATE_EVENT_ID)
+        futil.add_handler(cameraUpdateEvent, onCameraUpdate, name=f"{config.ADDIN_NAME}_camera_update")
 
-        if installedPygame:
+        if selectedJoystickBackend == BACKEND_PYGAME:
             pygame.init()
             pygameJoystickThread = PyGameThread(stopFlag)
             pygameJoystickThread.start()
-        else:
-            try:
-                loadPyJoystickEventLoop()
-            except:
-                futil.handle_error(f"{config.ADDIN_NAME}: pygame is unavailable and the SDL2 fallback could not be loaded. Install pygame or SDL2 and restart the add-in.", True)
-                return
+        elif selectedJoystickBackend == BACKEND_PYJOYSTICK:
             joystickThread = PyJoystickThread(stopFlag)
             joystickThread.start()
+        else:
+            futil.handle_error(
+                f"{config.ADDIN_NAME}: no joystick backend is available. Install pygame separately or install SDL2 for the vendored pyjoystick backend. Bootstrap error: {backendBootstrapError}",
+                True,
+            )
+            return
         renderThread = RenderThread(stopFlag)
         renderThread.start()
 
@@ -330,9 +422,17 @@ def run(context):
 
 def stop(context):
     try:
+        global cameraUpdateEvent
+        global cameraUpdateQueued
+        global pendingOrientation
         # Remove all of the event handlers your app has created
         futil.clear_handlers()
         stopFlag.set()
+        cameraUpdateQueued = False
+        pendingOrientation = None
+        if cameraUpdateEvent is not None:
+            app.unregisterCustomEvent(CAMERA_UPDATE_EVENT_ID)
+            cameraUpdateEvent = None
 
     except:
         futil.handle_error("stop")
@@ -351,25 +451,147 @@ def getAxisValue(axis: int, default: float = 0.0) -> float:
     return axisValues.get(axis, default)
 
 
+def getAxisValueByControlName(controlNames: tuple[str, ...], default: float = 0.0) -> float:
+    for controlName in controlNames:
+        if controlName in axisValuesByControlName:
+            return axisValuesByControlName[controlName]
+    return default
+
+
 def isPressed(button: int) -> bool:
     return button in pressedButtons
+
+
+def isPressedControl(controlNames: tuple[str, ...]) -> bool:
+    return any(controlName in pressedControlNames for controlName in controlNames)
 
 
 def isJoyconRightController() -> bool:
     return controllerProfile == CONTROLLER_PROFILE_JOYCON_RIGHT
 
 
-def setControllerProfileFromName(name: str):
-    global controllerProfile
-    if name is None:
-        return
-    lowerName = name.lower()
+def getKeyControlName(key: Key) -> str | None:
+    controlName = getattr(key, "controller_key_name", None)
+    if not controlName:
+        joystick = getattr(key, "joystick", None)
+        controllerMapping = getattr(joystick, "controller_mapping", {}) or {}
+        for mappedControlName, mappedKey in controllerMapping.items():
+            if mappedKey.keytype == key.keytype and mappedKey.number == key.number:
+                controlName = mappedControlName
+                break
+    if not controlName:
+        return None
+    try:
+        return controlName.decode("utf-8").lower()
+    except AttributeError:
+        return str(controlName).lower()
+
+
+def getJoystickGuidString(joy: Joystick) -> str:
+    guid = getattr(joy, "guid", b"")
+    try:
+        return guid.decode("utf-8").lower()
+    except AttributeError:
+        return str(guid).lower()
+
+
+def getJoystickControlNames(joy: Joystick) -> set[str]:
+    keyMapping = getattr(joy, "key_mapping", {}) or {}
+    return {str(controlName).lower() for controlName in keyMapping.values() if controlName}
+
+
+def looksLikeJoyconRight(joy: Joystick | None, name: str | None) -> bool:
+    lowerName = (name or "").lower()
     if any(keyword in lowerName for keyword in JOYCON_NAME_KEYWORDS):
+        return True
+    if joy is None:
+        return False
+
+    guid = getJoystickGuidString(joy)
+    if any(keyword in guid for keyword in JOYCON_GUID_KEYWORDS):
+        return True
+
+    controlNames = getJoystickControlNames(joy)
+    return {"a", "b", "x", "y", "leftx", "lefty"}.issubset(controlNames)
+
+
+def getPygameGuidString(joy) -> str:
+    if joy is None or not hasattr(joy, "get_guid"):
+        return ""
+    try:
+        return str(joy.get_guid()).lower()
+    except:
+        return ""
+
+
+def maybeSetJoyconProfileFromRawEvent(button: int | None = None, axis: int | None = None, joystick=None) -> None:
+    global controllerProfile
+
+    if controllerProfile == CONTROLLER_PROFILE_JOYCON_RIGHT:
+        return
+
+    if joystick is not None:
+        try:
+            if looksLikeJoyconRight(joystick, joystick.get_name() if hasattr(joystick, "get_name") else joystick.get_name()):
+                controllerProfile = CONTROLLER_PROFILE_JOYCON_RIGHT
+                logDetectedControllerProfile(getattr(joystick, "get_name", lambda: "")(), joystick, "Joy-Con (R)")
+                return
+        except:
+            pass
+
+        pygameGuid = getPygameGuidString(joystick)
+        if any(keyword in pygameGuid for keyword in JOYCON_GUID_KEYWORDS):
+            controllerProfile = CONTROLLER_PROFILE_JOYCON_RIGHT
+            futil.log(f"{config.ADDIN_NAME}: detected Joy-Con (R) profile from pygame guid={pygameGuid!r}", LogLevels.InfoLogLevel)
+            return
+
+    if button is not None and button in JOYCON_RAW_SIGNATURE_BUTTONS:
         controllerProfile = CONTROLLER_PROFILE_JOYCON_RIGHT
-        futil.log(f"{config.ADDIN_NAME}: detected Joy-Con (R) profile from '{name}'")
+        futil.log(
+            f"{config.ADDIN_NAME}: detected Joy-Con (R) profile from raw button signature {button}",
+            LogLevels.InfoLogLevel,
+        )
+        return
+
+    if axis is not None and axis in (JOYCON_STICK_X_AXIS, JOYCON_STICK_Y_AXIS):
+        try:
+            lowerName = (getattr(joystick, "get_name", lambda: "")() or "").lower()
+        except:
+            lowerName = ""
+        if lowerName == "":
+            futil.log(
+                f"{config.ADDIN_NAME}: observed unnamed controller axis {axis}; waiting for a Joy-Con signature button to confirm profile",
+                LogLevels.InfoLogLevel,
+            )
+
+
+def logDetectedControllerProfile(name: str | None, joy: Joystick | None, profile: str) -> None:
+    nameForLog = name or ""
+    if joy is None:
+        futil.log(f"{config.ADDIN_NAME}: detected {profile} controller profile from '{nameForLog}'")
+        return
+
+    guid = getJoystickGuidString(joy)
+    controls = sorted(getJoystickControlNames(joy))
+    futil.log(
+        f"{config.ADDIN_NAME}: detected {profile} controller profile from name={nameForLog!r}, guid={guid!r}, controls={controls}",
+        LogLevels.InfoLogLevel,
+    )
+
+
+def setControllerProfileFromJoystick(joy: Joystick):
+    name = joy.get_name() if joy is not None else None
+    setControllerProfileFromName(name, joy)
+
+
+def setControllerProfileFromName(name: str, joy: Joystick | None = None):
+    global controllerProfile
+    if looksLikeJoyconRight(joy, name):
+        controllerProfile = CONTROLLER_PROFILE_JOYCON_RIGHT
+        logDetectedControllerProfile(name, joy, "Joy-Con (R)")
     elif controllerProfile != CONTROLLER_PROFILE_JOYCON_RIGHT:
         controllerProfile = CONTROLLER_PROFILE_DEFAULT
-        futil.log(f"{config.ADDIN_NAME}: detected default controller profile from '{name}'")
+        logDetectedControllerProfile(name, joy, "default")
 
 
 def getPanXAxis() -> float:
@@ -409,9 +631,22 @@ def getZoomAxis() -> float:
     return deadZone(((getAxisValue(ZOOM_POS_AXIS) + 1)/2) - ((getAxisValue(ZOOM_NEG_AXIS) + 1)/2))
 
 
+def applyJoyconResponseCurve(axis: float, exponent: float) -> float:
+    if axis == 0:
+        return 0.0
+    sign = 1.0 if axis > 0 else -1.0
+    return sign * pow(abs(axis), exponent)
+
+
 def getJoyconModeAxes() -> tuple[float, float, float, float, float]:
-    stickX = deadZone(getAxisValue(JOYCON_STICK_X_AXIS))
-    stickY = deadZone(getAxisValue(JOYCON_STICK_Y_AXIS)) * -1
+    stickX = deadZone(getAxisValueByControlName(JOYCON_AXIS_NAME_X, getAxisValue(JOYCON_STICK_X_AXIS)))
+    stickY = deadZone(getAxisValueByControlName(JOYCON_AXIS_NAME_Y, getAxisValue(JOYCON_STICK_Y_AXIS)))
+
+    curvedPanX = applyJoyconResponseCurve(stickX, JOYCON_PAN_RESPONSE_EXPONENT)
+    curvedPanY = applyJoyconResponseCurve(stickY, JOYCON_PAN_RESPONSE_EXPONENT)
+    curvedRotateX = applyJoyconResponseCurve(stickX, JOYCON_ROTATION_HORIZONTAL_RESPONSE_EXPONENT)
+    curvedRotateY = applyJoyconResponseCurve(stickY, JOYCON_ROTATION_VERTICAL_RESPONSE_EXPONENT)
+    curvedZoom = applyJoyconResponseCurve(stickY, JOYCON_ZOOM_RESPONSE_EXPONENT)
 
     panX = 0.0
     panY = 0.0
@@ -419,14 +654,14 @@ def getJoyconModeAxes() -> tuple[float, float, float, float, float]:
     rotateY = 0.0
     zoom = 0.0
 
-    if isPressed(JOYCON_BUTTON_ZR):
-        panX = stickX
-        panY = stickY
-    elif isPressed(JOYCON_BUTTON_R):
-        zoom = stickY
+    if isPressedControl(JOYCON_BUTTON_NAME_ZR) or isPressed(JOYCON_BUTTON_ZR):
+        zoom = curvedZoom * -JOYCON_ZOOM_SENSITIVITY
+    elif isPressedControl(JOYCON_BUTTON_NAME_R) or isPressed(JOYCON_BUTTON_R):
+        panX = curvedPanX * JOYCON_PAN_SENSITIVITY
+        panY = curvedPanY * JOYCON_PAN_SENSITIVITY
     else:
-        rotateX = stickX
-        rotateY = stickY
+        rotateX = curvedRotateX * JOYCON_ROTATION_HORIZONTAL_SENSITIVITY
+        rotateY = curvedRotateY * JOYCON_ROTATION_VERTICAL_SENSITIVITY
 
     return (panX, panY, rotateX, rotateY, zoom)
 
@@ -446,17 +681,21 @@ def hatCam(hatName: str):
     """
     Orient the camera for a given hat direction press
     """
-    orientCam(HAT_TO_VIEW.get(hatName))
+    queueOrientation(HAT_TO_VIEW.get(hatName))
 
 
-def buttonCam(button: int):
+def buttonCam(button: int, controlName: str | None = None):
     """
     Orient the camera for a given button press
     """
     if isJoyconRightController():
-        orientCam(JOYCON_BUTTON_TO_VIEW.get(button))
+        if controlName:
+            queueOrientation(JOYCON_BUTTON_NAME_TO_VIEW.get(controlName))
+            if controlName in JOYCON_BUTTON_NAME_TO_VIEW:
+                return
+        queueOrientation(JOYCON_BUTTON_TO_VIEW.get(button))
         return
-    orientCam(BUTTON_TO_VIEW.get(button))
+    queueOrientation(BUTTON_TO_VIEW.get(button))
 
 
 def orientCam(nextOrientation: ViewOrientations | Literal[-1, -2]) -> Camera :
@@ -479,6 +718,17 @@ def orientCam(nextOrientation: ViewOrientations | Literal[-1, -2]) -> Camera :
         cam.isSmoothTransition = True
     else:
         cam.viewOrientation = nextOrientation
+        setCam(cam)
+
+        orientationUpVector = getOrientationUpVector(nextOrientation)
+        if orientationUpVector is None:
+            return
+
+        cam = app.activeViewport.camera
+        cam.isSmoothTransition = False
+        cam.upVector = orientationUpVector
+        setCam(cam)
+        return
     setCam(cam)
 
 
@@ -499,6 +749,8 @@ def moveCamForAxes(
         return
 
     cam = app.activeViewport.camera
+    initialViewExtents = cam.viewExtents
+    referenceUpVector = getWorldUpVector()
 
     horizontalRotationMatrix = Matrix3D.create()
     verticalRotationMatrix = Matrix3D.create()
@@ -506,15 +758,12 @@ def moveCamForAxes(
     eye = cam.eye.copy()
 
     frontVector = getFrontVector()
-    leftVector = getLeftVector()
+    leftVector = getOrbitLeftVector(frontVector, referenceUpVector, getLeftVector())
+    upVector = getLeveledUpVector(frontVector, referenceUpVector, cam.upVector)
 
-    # Update the upVector early during a horizontal rotation before continuing
-    # so that other calculations are correct
     horizontalRotationMatrix.setToRotation(
-        axisToRadian(rotateYAxis), leftVector, target
+        axisToRadian(-rotateYAxis), leftVector, target
     )
-    upVector = newUpFromRotatingHorizontal(cam, horizontalRotationMatrix)
-    constrainedUpVector = getConstrainedVector(upVector)
 
     # failed attempts to get the correct upVector
     # upVector = newUpFromInvertedHorizontal(cam, horizontalRotationMatrix)
@@ -525,7 +774,7 @@ def moveCamForAxes(
     verticalPanVector = getVerticalPanVector(scalePanAxis(panYAxis), upVector)
     horizontalPanVector = getHorizontalPanVector(scalePanAxis(panXAxis), leftVector)
 
-    verticalRotationMatrix.setToRotation(axisToRadian(rotateXAxis), constrainedUpVector, target)
+    verticalRotationMatrix.setToRotation(axisToRadian(rotateXAxis), referenceUpVector, target)
 
     panVector = horizontalPanVector.copy()
     panVector.add(verticalPanVector)
@@ -537,16 +786,14 @@ def moveCamForAxes(
 
     if zoomVector.length > 0:
         eye.translateBy(zoomVector)
-        extentVector = target.asVector()
-        extentVector.subtract(eye.asVector())
-        cam.setExtents(
-            extentVector.length * ZOOM_EXTENT_MULTIPLIER,
-            extentVector.length * ZOOM_EXTENT_MULTIPLIER,
-        )
+        newFrontVector = target.vectorTo(eye)
+        if frontVector.length > CAMERA_VECTOR_EPSILON and newFrontVector.length > CAMERA_VECTOR_EPSILON:
+            cam.viewExtents = initialViewExtents * (newFrontVector.length / frontVector.length)
 
     # Rotate only the eye
     eye.transformBy(horizontalRotationMatrix)
     eye.transformBy(verticalRotationMatrix)
+    upVector = getLeveledUpVector(target.vectorTo(eye), referenceUpVector, upVector)
 
     # Apply changes
     cam.upVector = upVector
@@ -554,6 +801,24 @@ def moveCamForAxes(
     cam.target = target
     cam.eye = eye
     setCam(cam)
+
+
+def getOrientationUpVector(
+    orientation: ViewOrientations | Literal[-1, -2],
+) -> Vector3D | None:
+    if orientation in (
+        ViewOrientations.FrontViewOrientation,
+        ViewOrientations.BackViewOrientation,
+        ViewOrientations.LeftViewOrientation,
+        ViewOrientations.RightViewOrientation,
+    ):
+        return getWorldUpVector()
+    if orientation in (
+        ViewOrientations.TopViewOrientation,
+        ViewOrientations.BottomViewOrientation,
+    ):
+        return Vector3D.create(0, 1, 0)
+    return None
 
 
 def newUpFromInvertedHorizontal(
@@ -712,6 +977,61 @@ def getLeftVector() -> Vector3D:
     """
     cam = app.activeViewport.camera
     return cam.upVector.crossProduct(cam.target.vectorTo(cam.eye))
+
+
+def getWorldUpVector() -> Vector3D:
+    """
+    Fusion uses a Z-up world, so keep orbit aligned to that stable axis.
+    """
+    return Vector3D.create(0, 0, 1)
+
+
+def getOrbitLeftVector(
+    frontVector: Vector3D,
+    referenceUpVector: Vector3D,
+    fallbackLeftVector: Vector3D,
+) -> Vector3D:
+    """
+    Build a stable orbit-left vector from a reference up axis.
+    """
+    leftVector = referenceUpVector.crossProduct(frontVector)
+    if leftVector.length <= CAMERA_VECTOR_EPSILON:
+        return fallbackLeftVector.copy()
+    return leftVector
+
+
+def getLeveledUpVector(
+    frontVector: Vector3D,
+    referenceUpVector: Vector3D,
+    fallbackUpVector: Vector3D,
+) -> Vector3D:
+    """
+    Rebuild the camera up vector so orbit stays level relative to a stable reference axis.
+    """
+    if frontVector.length <= CAMERA_VECTOR_EPSILON:
+        return fallbackUpVector.copy()
+
+    normalizedFrontVector = frontVector.copy()
+    normalizedFrontVector.scaleBy(1 / normalizedFrontVector.length)
+
+    leveledUpVector = referenceUpVector.copy()
+    projectionOntoFront = normalizedFrontVector.copy()
+    projectionOntoFront.scaleBy(leveledUpVector.dotProduct(normalizedFrontVector))
+    leveledUpVector.subtract(projectionOntoFront)
+
+    if leveledUpVector.length <= CAMERA_VECTOR_EPSILON:
+        leveledUpVector = fallbackUpVector.copy()
+        projectionOntoFront = normalizedFrontVector.copy()
+        projectionOntoFront.scaleBy(leveledUpVector.dotProduct(normalizedFrontVector))
+        leveledUpVector.subtract(projectionOntoFront)
+        if leveledUpVector.length <= CAMERA_VECTOR_EPSILON:
+            return referenceUpVector.copy()
+
+    if leveledUpVector.dotProduct(fallbackUpVector) < 0:
+        leveledUpVector.scaleBy(-1)
+
+    leveledUpVector.scaleBy(1 / leveledUpVector.length)
+    return leveledUpVector
 
 
 def constrain(vector: Vector3D) -> Vector3D:

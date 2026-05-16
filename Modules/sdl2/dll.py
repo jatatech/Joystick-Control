@@ -100,7 +100,11 @@ def _macos_fallback_paths():
         "/Library/Frameworks",
         "/usr/local/lib",
         "/usr/local/Frameworks",
+        "/usr/local/opt/sdl2/lib",
+        "/usr/local/opt/sdl2/Frameworks",
         "/opt/homebrew/lib",
+        "/opt/homebrew/opt/sdl2/lib",
+        "/opt/homebrew/opt/sdl2/Frameworks",
         "/opt/homebrew/Frameworks",
     ]
 

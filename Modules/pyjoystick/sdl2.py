@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import platform
@@ -81,8 +83,14 @@ class Joystick(BaseJoystick):
             # print('ID:', raw_joystick, SDL_JoystickGetAttached(raw_joystick))
 
         try:
-            joy.identifier = sdl2.SDL_JoystickID(instance_id).value
-            # joy.identifier = SDL_JoystickInstanceID(raw_joystick)
+            try:
+                joy.identifier = sdl2.SDL_JoystickInstanceID(joy.joystick)
+            except AttributeError:
+                joy.identifier = instance_id
+            try:
+                joy.identifier = joy.identifier.value
+            except AttributeError:
+                pass
             joy.name = sdl2.SDL_JoystickName(joy.joystick).decode('utf-8')
             joy.numaxes = sdl2.SDL_JoystickNumAxes(joy.joystick)
             joy.numbuttons = sdl2.SDL_JoystickNumButtons(joy.joystick)
