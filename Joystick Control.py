@@ -41,7 +41,7 @@ def installPygameWindows():
 
 installedPygame = False
 
-if platform.system() is 'Windows':
+if platform.system() == "Windows":
     (installedPygame, original_sys_path) = installPygameWindows()
     if installedPygame:
         try:
@@ -52,8 +52,12 @@ if platform.system() is 'Windows':
             installedPygame = False
     sys.path = original_sys_path
 else:
-    #TODO: figure out where the python executable is on mac
-    futil.handle_error("Sorry, this OS is unsupported, falling back to use pyjoystick (less gamepad support)", True)
+    try:
+        import pygame
+        installedPygame = True
+        futil.log(f"{config.ADDIN_NAME}: using existing pygame install", LogLevels.InfoLogLevel)
+    except:
+        futil.log(f"{config.ADDIN_NAME}: pygame unavailable, falling back to pyjoystick", LogLevels.WarningLogLevel)
 
 
 # pyjoystic must be imported after pygame as it causes dynamic linking issues with SDL2
@@ -73,6 +77,8 @@ from typing import Literal
 HOME_ORIENTATION = -1
 # Special number to tell the camera to constrain the upVector to a primary axis
 CONSTRAIN_ORIENTATION = -2
+CONTROLLER_PROFILE_DEFAULT = "default"
+CONTROLLER_PROFILE_JOYCON_RIGHT = "joycon_right"
 
 # Configure as you wish
 ZOOM_SCALE = 0.1
@@ -81,6 +87,19 @@ ROTATION_AXIS_SCALE = 0.01
 PAN_ZOOM_COMPENSATION = 0.0005
 ZOOM_EXTENT_MULTIPLIER = 0.1
 AXIS_DEADZONE = 0.15
+JOYCON_STICK_X_AXIS = 0
+JOYCON_STICK_Y_AXIS = 1
+JOYCON_BUTTON_B = 0
+JOYCON_BUTTON_A = 1
+JOYCON_BUTTON_Y = 2
+JOYCON_BUTTON_X = 3
+JOYCON_BUTTON_R = 5
+JOYCON_BUTTON_ZR = 7
+JOYCON_BUTTON_PLUS = 9
+JOYCON_BUTTON_STICK = 11
+JOYCON_BUTTON_HOME = 12
+JOYCON_BUTTON_SR = 13
+JOYCON_BUTTON_SL = 14
 if not installedPygame:
     PAN_X_AXIS = 0
     PAN_Y_AXIS = 1
@@ -108,6 +127,23 @@ BUTTON_TO_VIEW = {
     2: HOME_ORIENTATION,
     9: CONSTRAIN_ORIENTATION,
 }
+JOYCON_BUTTON_TO_VIEW = {
+    JOYCON_BUTTON_A: ViewOrientations.FrontViewOrientation,
+    JOYCON_BUTTON_B: ViewOrientations.BackViewOrientation,
+    JOYCON_BUTTON_X: ViewOrientations.TopViewOrientation,
+    JOYCON_BUTTON_Y: ViewOrientations.BottomViewOrientation,
+    JOYCON_BUTTON_HOME: HOME_ORIENTATION,
+    JOYCON_BUTTON_STICK: CONSTRAIN_ORIENTATION,
+    JOYCON_BUTTON_PLUS: ViewOrientations.RightViewOrientation,
+    JOYCON_BUTTON_SR: ViewOrientations.LeftViewOrientation,
+}
+
+JOYCON_NAME_KEYWORDS = (
+    "joy-con (r)",
+    "joycon (r)",
+    "joy-con right",
+    "joycon right",
+)
 
 
 class PyJoystickThread(Thread):
@@ -122,31 +158,33 @@ class PyJoystickThread(Thread):
 
     def handle_key_event(self, key: Key):
         """
-        Assigns axis values into the global axes variable so the RenderThread
+        Assigns axis values into the global axisValues variable so the RenderThread
         can pick them up
 
         Args:
             key (Key): joystick keys
         """
         if key.keytype is KeyTypes.AXIS:
-            if key.number < 6:
-                axes[key.number] = key.get_proper_value()
-            else:
-                futil.log(f"{config.ADDIN_NAME}: unknown axis: {key.number}: {key.get_proper_value()}")
+            axisValues[key.number] = key.get_proper_value()
         elif key.keytype is KeyTypes.HAT:
             hatCam(key.get_hat_name())
-        elif key.keytype is KeyTypes.BUTTON and key.value == 0:
-            buttonCam(key.number)
+        elif key.keytype is KeyTypes.BUTTON:
+            if key.value:
+                pressedButtons.add(key.number)
+                buttonCam(key.number)
+            else:
+                pressedButtons.discard(key.number)
 
     def add(self, joy: Joystick):
         """
-        useless, but pyjoystick doesn't work without it
+        pyjoystick doesn't work without this callback, so use it to detect profile.
         """
+        setControllerProfileFromName(joy.get_name())
         return
 
     def remove(self, joy: Joystick):
         """
-        useless, but pyjoystick doesn't work without it
+        pyjoystick doesn't work without this callback.
         """
         return
 
@@ -169,6 +207,11 @@ class PyGameThread(Thread):
     def run(self):
         try:
             self.pygameJoysticks = {}
+            pygame.joystick.init()
+            for index in range(pygame.joystick.get_count()):
+                joy = pygame.joystick.Joystick(index)
+                self.pygameJoysticks[joy.get_instance_id()] = joy
+                setControllerProfileFromName(joy.get_name())
             while alive():
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -178,18 +221,24 @@ class PyGameThread(Thread):
                     if event.type == pygame.JOYDEVICEADDED:
                         joy = pygame.joystick.Joystick(event.device_index)
                         self.pygameJoysticks[joy.get_instance_id()] = joy
+                        setControllerProfileFromName(joy.get_name())
 
                     if event.type == pygame.JOYDEVICEREMOVED:
-                        del self.pygameJoysticks[event.instance_id]
+                        if event.instance_id in self.pygameJoysticks:
+                            del self.pygameJoysticks[event.instance_id]
 
                     if event.type == pygame.JOYBUTTONDOWN:
+                        pressedButtons.add(event.button)
                         buttonCam(event.button)
+
+                    if event.type == pygame.JOYBUTTONUP:
+                        pressedButtons.discard(event.button)
 
                     if event.type == pygame.JOYHATMOTION:
                         hatCam(pygameToHatName(event.value))
 
                     if event.type == pygame.JOYAXISMOTION:
-                        axes[event.axis] = event.value
+                        axisValues[event.axis] = event.value
         except:
             pass
 
@@ -205,13 +254,7 @@ class RenderThread(Thread):
     def run(self):
         while alive():
             try:
-                moveCamForAxes(
-                    getPanXAxis(axes),
-                    getPanYAxis(axes),
-                    getRotateXAxis(axes),
-                    getRotateYAxis(axes),
-                    getZoomAxis(axes),
-                )
+                moveCamForCurrentInput()
                 sleep(0.01)
             except:
                 pass
@@ -220,10 +263,14 @@ class RenderThread(Thread):
 def run(context):
     try:
         global stopFlag
-        global axes
+        global axisValues
+        global pressedButtons
+        global controllerProfile
         global app
         app = Application.get()
-        axes = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        axisValues = {}
+        pressedButtons = set()
+        controllerProfile = CONTROLLER_PROFILE_DEFAULT
         stopFlag = Event()
 
         if installedPygame:
@@ -259,41 +306,99 @@ def deadZone(axis: float) -> float:
     return axis
 
 
-def getPanXAxis(axes: list[float]) -> float:
+def getAxisValue(axis: int, default: float = 0.0) -> float:
+    return axisValues.get(axis, default)
+
+
+def isPressed(button: int) -> bool:
+    return button in pressedButtons
+
+
+def isJoyconRightController() -> bool:
+    return controllerProfile == CONTROLLER_PROFILE_JOYCON_RIGHT
+
+
+def setControllerProfileFromName(name: str):
+    global controllerProfile
+    if name is None:
+        return
+    lowerName = name.lower()
+    if any(keyword in lowerName for keyword in JOYCON_NAME_KEYWORDS):
+        controllerProfile = CONTROLLER_PROFILE_JOYCON_RIGHT
+        futil.log(f"{config.ADDIN_NAME}: detected Joy-Con (R) profile from '{name}'")
+    elif controllerProfile != CONTROLLER_PROFILE_JOYCON_RIGHT:
+        controllerProfile = CONTROLLER_PROFILE_DEFAULT
+        futil.log(f"{config.ADDIN_NAME}: detected default controller profile from '{name}'")
+
+
+def getPanXAxis() -> float:
     """
     Get the axis for X panning. Configure this by updating PAN_X_AXIS
     """
-    return deadZone(axes[PAN_X_AXIS])
+    return deadZone(getAxisValue(PAN_X_AXIS))
 
 
-def getPanYAxis(axes: list[float]) -> float:
+def getPanYAxis() -> float:
     """
     Get the axis for Y panning. Configure this by updating PAN_Y_AXIS
     """
-    return deadZone(axes[PAN_Y_AXIS]) * -1
+    return deadZone(getAxisValue(PAN_Y_AXIS)) * -1
 
 
-def getRotateXAxis(axes: list[float]) -> float:
+def getRotateXAxis() -> float:
     """
     Get the axis for X rotation. Configure this by updating ROTATE_X_AXIS
     """
-    return deadZone(axes[ROTATE_X_AXIS])
+    return deadZone(getAxisValue(ROTATE_X_AXIS))
 
 
-def getRotateYAxis(axes: list[float]) -> float:
+def getRotateYAxis() -> float:
     """
     Get the axis for Y rotation. Configure this by updating ROTATE_Y_AXIS
     """
-    return deadZone(axes[ROTATE_Y_AXIS]) * -1
+    return deadZone(getAxisValue(ROTATE_Y_AXIS)) * -1
 
 
-def getZoomAxis(axes: list[float]) -> float:
+def getZoomAxis() -> float:
     """
     Get the axis for zoom. Configure this by updating ZOOM_POS_AXIS and ZOOM_NEG_AXIS
     """
     if not installedPygame:
-        return deadZone(axes[ZOOM_POS_AXIS] - axes[ZOOM_NEG_AXIS])
-    return deadZone(((axes[ZOOM_POS_AXIS] + 1)/2) - ((axes[ZOOM_NEG_AXIS] + 1)/2))
+        return deadZone(getAxisValue(ZOOM_POS_AXIS) - getAxisValue(ZOOM_NEG_AXIS))
+    return deadZone(((getAxisValue(ZOOM_POS_AXIS) + 1)/2) - ((getAxisValue(ZOOM_NEG_AXIS) + 1)/2))
+
+
+def getJoyconModeAxes() -> tuple[float, float, float, float, float]:
+    stickX = deadZone(getAxisValue(JOYCON_STICK_X_AXIS))
+    stickY = deadZone(getAxisValue(JOYCON_STICK_Y_AXIS)) * -1
+
+    panX = 0.0
+    panY = 0.0
+    rotateX = 0.0
+    rotateY = 0.0
+    zoom = 0.0
+
+    if isPressed(JOYCON_BUTTON_ZR):
+        panX = stickX
+        panY = stickY
+    elif isPressed(JOYCON_BUTTON_R):
+        zoom = stickY
+    else:
+        rotateX = stickX
+        rotateY = stickY
+
+    return (panX, panY, rotateX, rotateY, zoom)
+
+
+def getCurrentInputAxes() -> tuple[float, float, float, float, float]:
+    if isJoyconRightController():
+        return getJoyconModeAxes()
+    return (getPanXAxis(), getPanYAxis(), getRotateXAxis(), getRotateYAxis(), getZoomAxis())
+
+
+def moveCamForCurrentInput() -> None:
+    panX, panY, rotateX, rotateY, zoom = getCurrentInputAxes()
+    moveCamForAxes(panX, panY, rotateX, rotateY, zoom)
 
 
 def hatCam(hatName: str):
@@ -307,10 +412,13 @@ def buttonCam(button: int):
     """
     Orient the camera for a given button press
     """
+    if isJoyconRightController():
+        orientCam(JOYCON_BUTTON_TO_VIEW.get(button))
+        return
     orientCam(BUTTON_TO_VIEW.get(button))
 
 
-def orientCam(nextOrientation: ViewOrientations | Literal[-1]) -> Camera :
+def orientCam(nextOrientation: ViewOrientations | Literal[-1, -2]) -> Camera :
     """
     Orient the activeViewport's camera to the chosen orientation
 
