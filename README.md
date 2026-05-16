@@ -40,6 +40,26 @@ I've set up what I think is a comfortable curve for the panning axes: f((x*10)^3
 
 This can be configured by editing `scalePanAxis` method.
 
+# Nintendo Switch Joy-Con (Right, v1) support
+
+The add-in now supports a single right Joy-Con profile (auto-detected from joystick name) and is intended to work on both Windows and macOS:
+
+- Stick (default): rotate view
+- Hold **ZR** + stick: pan view
+- Hold **R** + stick up/down: zoom in/out
+- **Home**: go to Fusion home view
+
+Additional default Joy-Con mappings:
+- **A**: front view
+- **B**: back view
+- **X**: top view
+- **Y**: bottom view
+- **Stick press**: constrain orientation to nearest primary axis
+- **+**: right view
+- **SR**: left view
+
+If your Joy-Con reports different button numbers on your machine/driver, update the `JOYCON_*` constants near the top of `Joystick Control.py`.
+
 # Implementation notes
 
 Given Fusion 360's weird setup for using libraries, I found it easier to use some simpler libraries, and found [pyjoystick](https://github.com/justengel/pyjoystick). It took some slight modification to get it working using local references to other libraries. I'm not sure how the `import pygame` in there works, but it seems to work on my local machine. Fusion 360 supposedly operates in a 64 bit architecture container, and I've tested that the sdl dll lookup for windows works. I don't know if it works for mac.
