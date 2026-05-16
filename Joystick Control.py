@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 
 from . import config
 from .lib import fusionAddInUtils as futil
@@ -181,11 +182,228 @@ JOYCON_NAME_KEYWORDS = (
 )
 
 CAMERA_UPDATE_EVENT_ID = f"{config.COMPANY_NAME}_{config.ADDIN_NAME}_camera_update".replace(" ", "_")
+SETTINGS_FILE = os.path.join(ADDIN_DIR, "joystick_settings.json")
+SETTINGS_COMMAND_ID = f"{config.COMPANY_NAME}_{config.ADDIN_NAME}_settings".replace(" ", "_")
+SETTINGS_COMMAND_NAME = "Joystick Settings"
+SETTINGS_COMMAND_DESCRIPTION = "Adjust joystick sensitivity and response settings."
+SETTINGS_WORKSPACE_ID = "FusionSolidEnvironment"
+SETTINGS_PANEL_ID = "SolidScriptsAddinsPanel"
+
+SETTINGS_FIELDS = (
+    {
+        "key": "AXIS_DEADZONE",
+        "input_id": "axis_deadzone",
+        "label": "Axis Deadzone",
+        "min": 0.0,
+        "max": 0.5,
+        "step": 0.01,
+    },
+    {
+        "key": "JOYCON_PAN_SENSITIVITY",
+        "input_id": "joycon_pan_sensitivity",
+        "label": "Pan Sensitivity",
+        "min": 0.05,
+        "max": 2.0,
+        "step": 0.01,
+    },
+    {
+        "key": "JOYCON_ROTATION_HORIZONTAL_SENSITIVITY",
+        "input_id": "joycon_rotation_horizontal_sensitivity",
+        "label": "Orbit Horizontal Sensitivity",
+        "min": 0.05,
+        "max": 2.0,
+        "step": 0.01,
+    },
+    {
+        "key": "JOYCON_ROTATION_VERTICAL_SENSITIVITY",
+        "input_id": "joycon_rotation_vertical_sensitivity",
+        "label": "Orbit Vertical Sensitivity",
+        "min": 0.05,
+        "max": 2.0,
+        "step": 0.01,
+    },
+    {
+        "key": "JOYCON_ZOOM_SENSITIVITY",
+        "input_id": "joycon_zoom_sensitivity",
+        "label": "Zoom Sensitivity",
+        "min": 0.05,
+        "max": 2.0,
+        "step": 0.01,
+    },
+    {
+        "key": "JOYCON_PAN_RESPONSE_EXPONENT",
+        "input_id": "joycon_pan_response_exponent",
+        "label": "Pan Response Exponent",
+        "min": 0.5,
+        "max": 3.0,
+        "step": 0.05,
+    },
+    {
+        "key": "JOYCON_ROTATION_HORIZONTAL_RESPONSE_EXPONENT",
+        "input_id": "joycon_rotation_horizontal_response_exponent",
+        "label": "Orbit Horizontal Response Exponent",
+        "min": 0.5,
+        "max": 3.0,
+        "step": 0.05,
+    },
+    {
+        "key": "JOYCON_ROTATION_VERTICAL_RESPONSE_EXPONENT",
+        "input_id": "joycon_rotation_vertical_response_exponent",
+        "label": "Orbit Vertical Response Exponent",
+        "min": 0.5,
+        "max": 3.0,
+        "step": 0.05,
+    },
+    {
+        "key": "JOYCON_ZOOM_RESPONSE_EXPONENT",
+        "input_id": "joycon_zoom_response_exponent",
+        "label": "Zoom Response Exponent",
+        "min": 0.5,
+        "max": 3.0,
+        "step": 0.05,
+    },
+)
+SETTINGS_FIELDS_BY_KEY = {field["key"]: field for field in SETTINGS_FIELDS}
 
 cameraUpdateEvent = None
 cameraStateLock = Lock()
 cameraUpdateQueued = False
 pendingOrientation = None
+settingsCommandDefinition = None
+settingsCommandControl = None
+
+
+def getCurrentSettings() -> dict[str, float]:
+    return {field["key"]: globals()[field["key"]] for field in SETTINGS_FIELDS}
+
+
+def clampSettingValue(field: dict[str, float | str], value) -> float:
+    try:
+        numericValue = float(value)
+    except (TypeError, ValueError):
+        numericValue = float(globals()[field["key"]])
+    return min(field["max"], max(field["min"], numericValue))
+
+
+def applySettings(settings: dict[str, float]) -> None:
+    for field in SETTINGS_FIELDS:
+        globals()[field["key"]] = clampSettingValue(field, settings.get(field["key"], globals()[field["key"]]))
+
+
+def loadSettings() -> None:
+    if not os.path.exists(SETTINGS_FILE):
+        return
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as settingsFile:
+            loadedSettings = json.load(settingsFile)
+        if not isinstance(loadedSettings, dict):
+            raise ValueError("settings file must contain a JSON object")
+
+        settings = getCurrentSettings()
+        for field in SETTINGS_FIELDS:
+            if field["key"] in loadedSettings:
+                settings[field["key"]] = loadedSettings[field["key"]]
+        applySettings(settings)
+    except Exception as settingsError:
+        futil.log(
+            f"{config.ADDIN_NAME}: failed to load settings from {SETTINGS_FILE!r} ({settingsError})",
+            LogLevels.WarningLogLevel,
+        )
+
+
+def saveSettings() -> None:
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as settingsFile:
+        json.dump(getCurrentSettings(), settingsFile, indent=2, sort_keys=True)
+
+
+def onSettingsCommandCreated(args) -> None:
+    command = args.command
+    inputs = command.commandInputs
+
+    for field in SETTINGS_FIELDS:
+        spinnerInput = inputs.addFloatSpinnerCommandInput(
+            field["input_id"],
+            field["label"],
+            "",
+            field["min"],
+            field["max"],
+            field["step"],
+            globals()[field["key"]],
+        )
+        spinnerInput.tooltip = field["label"]
+
+    futil.add_handler(command.execute, onSettingsCommandExecute, name=f"{config.ADDIN_NAME}_settings_execute")
+
+
+def onSettingsCommandExecute(args) -> None:
+    command = args.firingEvent.sender
+    inputs = command.commandInputs
+    updatedSettings = {}
+
+    for field in SETTINGS_FIELDS:
+        updatedSettings[field["key"]] = inputs.itemById(field["input_id"]).value
+
+    applySettings(updatedSettings)
+    saveSettings()
+    futil.log(f"{config.ADDIN_NAME}: updated joystick settings from Fusion UI", LogLevels.InfoLogLevel)
+
+
+def createSettingsCommand() -> None:
+    global settingsCommandDefinition
+    global settingsCommandControl
+
+    ui = app.userInterface
+    settingsCommandDefinition = ui.commandDefinitions.itemById(SETTINGS_COMMAND_ID)
+    if settingsCommandDefinition is None:
+        settingsCommandDefinition = ui.commandDefinitions.addButtonDefinition(
+            SETTINGS_COMMAND_ID,
+            SETTINGS_COMMAND_NAME,
+            SETTINGS_COMMAND_DESCRIPTION,
+        )
+    futil.add_handler(
+        settingsCommandDefinition.commandCreated,
+        onSettingsCommandCreated,
+        name=f"{config.ADDIN_NAME}_settings_created",
+    )
+
+    workspace = ui.workspaces.itemById(SETTINGS_WORKSPACE_ID)
+    if workspace is None:
+        futil.log(
+            f"{config.ADDIN_NAME}: workspace {SETTINGS_WORKSPACE_ID!r} was not found; settings command was not added to the UI",
+            LogLevels.WarningLogLevel,
+        )
+        return
+
+    panel = workspace.toolbarPanels.itemById(SETTINGS_PANEL_ID)
+    if panel is None:
+        futil.log(
+            f"{config.ADDIN_NAME}: toolbar panel {SETTINGS_PANEL_ID!r} was not found; settings command was not added to the UI",
+            LogLevels.WarningLogLevel,
+        )
+        return
+
+    settingsCommandControl = panel.controls.itemById(SETTINGS_COMMAND_ID)
+    if settingsCommandControl is None:
+        settingsCommandControl = panel.controls.addCommand(settingsCommandDefinition)
+
+
+def deleteSettingsCommand() -> None:
+    global settingsCommandDefinition
+    global settingsCommandControl
+
+    if settingsCommandControl is not None:
+        settingsCommandControl.deleteMe()
+        settingsCommandControl = None
+
+    ui = app.userInterface if app else None
+    if ui is None:
+        return
+
+    commandDefinition = ui.commandDefinitions.itemById(SETTINGS_COMMAND_ID)
+    if commandDefinition is not None:
+        commandDefinition.deleteMe()
+    settingsCommandDefinition = None
 
 
 def requestCameraUpdate() -> None:
@@ -397,6 +615,8 @@ def run(context):
         stopFlag = Event()
         cameraUpdateQueued = False
         pendingOrientation = None
+        loadSettings()
+        createSettingsCommand()
         cameraUpdateEvent = app.registerCustomEvent(CAMERA_UPDATE_EVENT_ID)
         futil.add_handler(cameraUpdateEvent, onCameraUpdate, name=f"{config.ADDIN_NAME}_camera_update")
 
@@ -426,6 +646,7 @@ def stop(context):
         global cameraUpdateQueued
         global pendingOrientation
         # Remove all of the event handlers your app has created
+        deleteSettingsCommand()
         futil.clear_handlers()
         stopFlag.set()
         cameraUpdateQueued = False

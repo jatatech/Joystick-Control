@@ -24,58 +24,102 @@ Set up with controls that make sense to me (using an XBox360 controller):
    - Right: right
  - Buttons also do views:
    - B: front
+
+  ## macOS SDL2 requirement
+
+  If you are using the vendored `pyjoystick` / SDL2 backend on macOS, SDL2 must already be installed on the machine. A typical setup is:
+
+  ```bash
+  brew install sdl2
+  ```
+
+  The add-in checks common Homebrew and framework locations for SDL2.
    - A: back
    - X: home
  - Since I'm frustrated by "ever so slightly tilted" rotations that I can't figure out, I added a "constrain to primary axis" to the right joystick press (I think that's called "R3" in gamepad buttons?)
+  The add-in supports two runtime backends:
 
-https://github.com/user-attachments/assets/aaf065e9-e6e6-4199-a3db-36f019b8c8fd
+  - an existing external `pygame` install, if one is already available to Fusion
+  - the vendored `pyjoystick` / SDL2 backend bundled in this repo
 
-https://www.youtube.com/watch?v=CueMOJzCEw0
-  
-If you don't like this setup, you should be able to configure it by updating the variables at the beginning.
+  The add-in does not create a virtual environment or install Python packages during startup.
 
-My joysticks seem to sit around .1 when resting, so I made the deadzone .15.
+  ## Generic controller defaults
 
-I've set up what I think is a comfortable curve for the panning axes: f((x*10)^3/10): ![image](https://github.com/user-attachments/assets/0fcb9818-7a36-49ad-83e3-5b76f7aa17c7)
+  The original Xbox-style defaults are still supported:
 
-This can be configured by editing `scalePanAxis` method.
-
-# Nintendo Switch Joy-Con (Right, v1) support
+  - Left stick: pan
+  - Right stick: orbit
+  - Triggers: zoom
+  - D-pad / hat: top, bottom, left, right views
+  - Face buttons: front, back, home
+  - Stick press: constrain orientation to the nearest primary axis
 
 The add-in now supports a single right Joy-Con profile (auto-detected from joystick name) and is intended to work on both Windows and macOS:
 
 - Stick (default): rotate view
-- Hold **ZR** + stick: pan view
-- Hold **R** + stick up/down: zoom in/out
-- **Home**: go to Fusion home view
-
-Additional default Joy-Con mappings:
-- **A**: front view
-- **B**: back view
-- **X**: top view
 - **Y**: bottom view
 - **Stick press**: constrain orientation to nearest primary axis
 - **+**: right view
-- **SR**: left view
+  The add-in supports a single right Joy-Con profile, auto-detected from joystick metadata or raw input signatures.
 
 If your Joy-Con reports different button numbers on your machine/driver, update the `JOYCON_*` constants near the top of `Joystick Control.py`.
-
-# Implementation notes
+  - Hold **R** + stick: pan view
+  - Hold **ZR** + stick up/down: zoom in/out
 
 Given Fusion 360's weird setup for using libraries, I found it easier to use some simpler libraries, and found [pyjoystick](https://github.com/justengel/pyjoystick). It took some slight modification to get it working using local references to other libraries. I'm not sure how the `import pygame` in there works, but it seems to work on my local machine. Fusion 360 supposedly operates in a 64 bit architecture container, and I've tested that the sdl dll lookup for windows works. I don't know if it works for mac.
 
-The libraries were installed using pip in a local folder and then copied up to the `Modules` folder.
+  - **X**: top view
+  - **A**: right view
+  - **B**: bottom view
+  - **Y**: left view
+  - **+**: front view
+  - **Stick press**: constrain orientation to nearest primary axis
+  - **SR**: left view
 
+  The standard view buttons now snap to deterministic upright orientations so repeated presses do not leave the camera slightly rolled.
+
+  # Settings UI
+
+  The add-in now exposes a `Joystick Settings` command in Fusion's Add-Ins panel. These values can be adjusted from Fusion's UI and are saved to a local `joystick_settings.json` file next to the add-in:
+
+  - axis deadzone
+  - pan sensitivity
+  - orbit horizontal sensitivity
+  - orbit vertical sensitivity
+  - zoom sensitivity
+  - pan response exponent
+  - orbit horizontal response exponent
+  - orbit vertical response exponent
+  - zoom response exponent
+
+  The saved settings file is machine-local and is intentionally ignored by git.
+
+  # Known limitations
+
+  - A small first-use zoom jump can still happen from some starting camera states.
+  - Orbiting near straight top/down views can still feel slightly jumpy because the camera is close to a singular orientation.
+
+  # Implementation notes
+
+  The add-in uses vendored copies of `pyjoystick` and SDL-related Python modules because Fusion's Python environment is not well-suited to dynamic dependency installation.
+
+  The vendored SDL2 path has local patches for:
+
+  - macOS SDL2 library discovery
+  - Joy-Con instance metadata handling in the vendored `pyjoystick` SDL wrapper
+
+  Camera mutations are marshalled back onto Fusion's main thread using a custom event so joystick input does not update the viewport from background threads.
+
+  If your Joy-Con reports different button numbers on your machine or driver, update the `JOYCON_*` constants near the top of `Joystick Control.py`.
 The add-in is marked as supporting mac. On startup it now chooses an already-installed `pygame` if one is available, otherwise it falls back to the vendored `pyjoystick`/SDL2 path.
+  # Release notes
 
-The add-in no longer creates a virtualenv or installs Python packages during Fusion startup. If you want the `pygame` backend, install it separately outside Fusion.
+  The current release baseline focuses on runtime stability and controller usability:
 
-For the vendored SDL2 path on macOS, the add-in checks common framework and Homebrew library locations for SDL2. If SDL2 is not already present, install it separately, for example with `brew install sdl2`.
-
-# What's next (if I get the motivation)
-
-- Given that I haven't taken any time to build any configuration UI, I'm holding off on publishing this to the add-in store. I may find the motivation to do that later.
-- It'd be great if I could figure out the constrained vertical orbit.
-- I don't understand how view extents work, maybe I should figure that out to make sure I'm not doing weird zoom stuff.
-
-If you're interested in these things getting done, a pull request or sponsorship will always help :).
+  - no startup-time package installation or virtualenv bootstrap
+  - working macOS vendored SDL2 fallback path
+  - Joy-Con (R) profile support
+  - main-thread camera updates for Fusion stability
+  - deterministic upright view snaps
+  - Fusion UI settings dialog for tuning
