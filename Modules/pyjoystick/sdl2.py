@@ -24,9 +24,9 @@ if check_os('win') and is_64_bit():
 elif check_os('win'):
     with SDL2_WIN32.as_file() as sdl_dll:
         os.environ.setdefault('PYSDL2_DLL_PATH', os.path.join(os.path.dirname(os.path.realpath(__file__)), "sdl2_win32"))
-        from ... import sdl2
+        from .. import sdl2
 else:
-    from ... import sdl2
+    from .. import sdl2
 # ========== END SDL2 Pathing ==========
 
 
