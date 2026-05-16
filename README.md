@@ -66,9 +66,9 @@ Given Fusion 360's weird setup for using libraries, I found it easier to use som
 
 The libraries were installed using pip in a local folder and then copied up to the `Modules` folder.
 
-The add-in is marked as supporting mac, but I haven't tried it there.
+The add-in is marked as supporting mac. It now attempts to create a local virtualenv and install `pygame` on macOS before falling back to `pyjoystick`/SDL2.
 
-An updated version of the add-in switched to attempting to use `pygame`, but since it's a very hacky setup to install `pygame`, that won't work on mac. There's still a chance that we will properly execute the fallback logic and have a working version on mac, but I have far less hope now (especially after I looked into how different the python environment is on mac vs windows).
+If the SDL2 fallback is needed on macOS, the add-in also checks common framework and Homebrew library locations for SDL2.
 
 # What's next (if I get the motivation)
 

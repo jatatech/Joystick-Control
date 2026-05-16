@@ -7,7 +7,33 @@ from . import config
 from .lib import fusionAddInUtils as futil
 from adsk.core import LogLevels
 
-def installPygameWindows():
+def getPythonExecutable():
+    addInDir = sys.path[0]
+    candidates = (
+        os.path.join(addInDir, "Python", "python.exe"),
+        os.path.join(addInDir, "Python", "python"),
+        sys.executable,
+    )
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return sys.executable
+
+
+def getVirtualenvPython(virtualenv):
+    if platform.system() == "Windows":
+        return os.path.join(virtualenv, "Scripts", "python.exe")
+    return os.path.join(virtualenv, "bin", "python")
+
+
+def getVirtualenvSitePackages(virtualenv):
+    if platform.system() == "Windows":
+        return os.path.join(virtualenv, "Lib", "site-packages")
+    pythonVersion = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    return os.path.join(virtualenv, "lib", pythonVersion, "site-packages")
+
+
+def installPygame():
     virtualenvDirName = f"{config.ADDIN_NAME}Venv"
     # Clean up path in case we crashed somewhere, sys should not contain our virtualenv yet
     sys.path = [dir for dir in sys.path if dir.find(virtualenvDirName) == -1]
@@ -15,8 +41,9 @@ def installPygameWindows():
     original_sys_path = sys.path.copy()
 
     virtualenv = os.path.join(sys.path[0], virtualenvDirName)
-    python = os.path.join(sys.path[0], "Python", "python.exe")
-    virtualenvSitePackages = os.path.join(virtualenv, "Lib", "site-packages")
+    python = getPythonExecutable()
+    virtualenvPython = getVirtualenvPython(virtualenv)
+    virtualenvSitePackages = getVirtualenvSitePackages(virtualenv)
 
     if not os.path.isdir(virtualenv):
         futil.log(f"{config.ADDIN_NAME}: missing virtualenv, creating...", LogLevels.WarningLogLevel)
@@ -24,7 +51,7 @@ def installPygameWindows():
 
     futil.log(f"{config.ADDIN_NAME}: virtualenv exists, attempting to import from virtualenv", LogLevels.InfoLogLevel)
     # in case of script failure, the virtualenv might already be in the path from a previous run
-    if not virtualenv in sys.path:
+    if virtualenvSitePackages not in sys.path:
         sys.path.insert(0, virtualenvSitePackages)
     try:
         import pygame
@@ -32,17 +59,22 @@ def installPygameWindows():
     except:
         try:
             futil.log(f"{config.ADDIN_NAME}: missing pygame, installing...", LogLevels.WarningLogLevel)
-            subprocess.check_call([os.path.join(virtualenv, "Scripts", "pip.exe"), "install", "--upgrade", "pygame"])
+            subprocess.check_call([virtualenvPython, "-m", "pip", "install", "--upgrade", "pygame"])
             futil.log(f"{config.ADDIN_NAME}: pygame installed", LogLevels.InfoLogLevel)
             return (True, original_sys_path.copy())
         except:
-            futil.handle_error("Failed to install and import pygame. See text console for more details", True)
+            futil.handle_error("Failed to install and import pygame. Falling back to pyjoystick if available. See text console for more details", True)
             return (False, original_sys_path.copy())
 
 installedPygame = False
+original_sys_path = sys.path.copy()
 
-if platform.system() == "Windows":
-    (installedPygame, original_sys_path) = installPygameWindows()
+try:
+    import pygame
+    installedPygame = True
+    futil.log(f"{config.ADDIN_NAME}: using existing pygame install", LogLevels.InfoLogLevel)
+except:
+    (installedPygame, original_sys_path) = installPygame()
     if installedPygame:
         try:
             import pygame
@@ -50,19 +82,21 @@ if platform.system() == "Windows":
         except:
             futil.handle_error(f"{config.ADDIN_NAME}: Failed to import pygame, falling back to use pyjoystick (less gamepad support). See text console for more details", True)
             installedPygame = False
-    sys.path = original_sys_path
-else:
-    try:
-        import pygame
-        installedPygame = True
-        futil.log(f"{config.ADDIN_NAME}: using existing pygame install", LogLevels.InfoLogLevel)
-    except:
+    else:
         futil.log(f"{config.ADDIN_NAME}: pygame unavailable, falling back to pyjoystick", LogLevels.WarningLogLevel)
+    sys.path = original_sys_path
 
 
-# pyjoystic must be imported after pygame as it causes dynamic linking issues with SDL2
-if not installedPygame:
-    from .Modules.pyjoystick.sdl2 import run_event_loop
+pyjoystickRunEventLoop = None
+
+
+def loadPyJoystickEventLoop():
+    global pyjoystickRunEventLoop
+    if pyjoystickRunEventLoop is None:
+        from .Modules.pyjoystick.sdl2 import run_event_loop as importedRunEventLoop
+        pyjoystickRunEventLoop = importedRunEventLoop
+    return pyjoystickRunEventLoop
+
 
 from .Modules.pyjoystick.interface import KeyTypes, Key, Joystick
 
@@ -190,6 +224,7 @@ class PyJoystickThread(Thread):
 
     def run(self):
         try:
+            run_event_loop = loadPyJoystickEventLoop()
             run_event_loop(
                 add_joystick=self.add,
                 remove_joystick=self.remove,
@@ -197,7 +232,8 @@ class PyJoystickThread(Thread):
                 alive=alive,
             )
         except:
-            pass
+            futil.handle_error(f"{config.ADDIN_NAME}: pyjoystick fallback failed to start. Install pygame or SDL2 and restart the add-in.", True)
+            self.stopped.set()
 
 class PyGameThread(Thread):
     def __init__(self, event: Event):
@@ -278,6 +314,11 @@ def run(context):
             pygameJoystickThread = PyGameThread(stopFlag)
             pygameJoystickThread.start()
         else:
+            try:
+                loadPyJoystickEventLoop()
+            except:
+                futil.handle_error(f"{config.ADDIN_NAME}: pygame is unavailable and the SDL2 fallback could not be loaded. Install pygame or SDL2 and restart the add-in.", True)
+                return
             joystickThread = PyJoystickThread(stopFlag)
             joystickThread.start()
         renderThread = RenderThread(stopFlag)
