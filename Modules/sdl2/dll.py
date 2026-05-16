@@ -93,6 +93,18 @@ def _so_version_num(libname):
     return list(map(int, libname.split('.so.')[1].split('.')))
 
 
+def _macos_fallback_paths():
+    """Return additional macOS library search paths for embedded Python hosts."""
+    return [
+        os.path.expanduser("~/Library/Frameworks"),
+        "/Library/Frameworks",
+        "/usr/local/lib",
+        "/usr/local/Frameworks",
+        "/opt/homebrew/lib",
+        "/opt/homebrew/Frameworks",
+    ]
+
+
 
 # Functions for allowing Microsoft Store Python to load image/ttf/mixer
 
@@ -207,13 +219,19 @@ def _findlib(libnames, path=None):
                 dllfile = "./" + dllfile
             results.append(dllfile)
 
-    # On ARM64 Macs, search the non-standard brew library path as a fallback
-    arm_brewpath = "/opt/Homebrew/lib"
-    is_apple_silicon = platform == "darwin" and cpu_arch() == "arm64"
-    if is_apple_silicon and os.path.exists(arm_brewpath):
-        results += _finds_libs_at_path(libnames, arm_brewpath, patterns)
+    if platform == "darwin":
+        for fallback_path in _macos_fallback_paths():
+            if os.path.exists(fallback_path):
+                results += _finds_libs_at_path(libnames, fallback_path, patterns)
 
-    return results
+    deduped = []
+    seen = set()
+    for libfile in results:
+        if libfile not in seen:
+            seen.add(libfile)
+            deduped.append(libfile)
+
+    return deduped
 
 
 # Classes for loading libraries and binding ctypes functions
